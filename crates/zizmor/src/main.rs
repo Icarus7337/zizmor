@@ -140,6 +140,12 @@ struct App {
     /// to audit the repository at a particular git reference state.
     #[arg(required = true)]
     inputs: Vec<String>,
+
+    #[arg(long)]
+    tpa_allowlist_file: Option<String>,
+
+    #[arg(long, value_delimiter = ',')]
+    tpa_allowed_org: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Copy, Clone, ValueEnum)]
@@ -158,6 +164,8 @@ pub(crate) enum OutputFormat {
     Sarif,
     /// GitHub Actions workflow command-formatted output.
     Github,
+    /// Third-Party Actions 
+    TpaList
 }
 
 #[derive(Debug, Copy, Clone, ValueEnum)]
@@ -608,6 +616,8 @@ fn run() -> Result<ExitCode> {
             serde_json::to_writer_pretty(stdout(), &output::sarif::build(results.findings()))?
         }
         OutputFormat::Github => output::github::output(stdout(), results.findings())?,
+        OutputFormat::TpaList => output::tpa_list::output(stdout(), results.findings())?,
+
     };
 
     if app.no_exit_codes || matches!(app.format, OutputFormat::Sarif) {

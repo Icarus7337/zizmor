@@ -1,4 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::Path;
 
 use anyhow::Context;
 use github_actions_models::common::{RepositoryUses, Uses};
@@ -11,16 +13,23 @@ use crate::models::{CompositeStep, Step, StepCommon, uses::UsesExt as _};
 
 pub(crate) struct UnpinnedUses {
     policies: UnpinnedUsesPolicies,
+    /// Combined set of official orgs and additional allowlisted orgs
+    allowed_orgs: HashSet<String>,
 }
 
 audit_meta!(UnpinnedUses, "unpinned-uses", "unpinned action reference");
+
+// Define a constant for the special message we'll look for in the TPA list formatter
+pub(crate) const THIRD_PARTY_MESSAGE: &str = "third-party action is not pinned to a commit SHA";
+
+// Default official GitHub organizations that are considered trusted
+const DEFAULT_OFFICIAL_ORGS: &[&str] = &["actions", "github", "dependabot"];
 
 impl UnpinnedUses {
     pub fn evaluate_pinning(&self, uses: &Uses) -> Option<(String, Severity, Persona)> {
         match uses {
             // Don't evaluate pinning for local `uses:`, since unpinned references
             // are fully controlled by the repository anyways.
-            // TODO: auditor-level findings instead, perhaps?
             Uses::Local(_) => None,
             // We don't have detailed policies for `uses: docker://` yet,
             // in part because evaluating the risk of a tagged versus hash-pinned
@@ -46,6 +55,18 @@ impl UnpinnedUses {
                 }
             }
             Uses::Repository(repo_uses) => {
+                // Check if this is a third-party action (not from allowlisted orgs)
+                let is_third_party = !self.allowed_orgs.contains(&repo_uses.owner.to_lowercase());
+                
+                // For third-party actions that aren't hash pinned, we use our special message
+                if is_third_party && uses.unhashed() {
+                    return Some((
+                        THIRD_PARTY_MESSAGE.into(),
+                        Severity::High,
+                        Persona::default(),
+                    ));
+                }
+                
                 let (pattern, policy) = self.policies.get_policy(repo_uses);
 
                 let pat_desc = match pattern {
@@ -77,11 +98,17 @@ impl UnpinnedUses {
                         Severity::High,
                         Persona::default(),
                     )),
-                    UsesPolicy::HashPin => uses.unhashed().then_some((
-                        format!("action is not pinned to a hash (required by {pat_desc} policy)"),
-                        Severity::High,
-                        Persona::default(),
-                    )),
+                    UsesPolicy::HashPin => {
+                        if uses.unhashed() && !is_third_party { // We've already handled third-party actions above
+                            Some((
+                                format!("action is not pinned to a hash (required by {pat_desc} policy)"),
+                                Severity::High,
+                                Persona::default(),
+                            ))
+                        } else {
+                            None
+                        }
+                    }
                 }
             }
         }
@@ -117,6 +144,8 @@ impl UnpinnedUses {
     }
 }
 
+// Update the Audit implementation in unpinned_uses.rs
+
 impl Audit for UnpinnedUses {
     fn new(state: &AuditState<'_>) -> Result<Self, AuditLoadError>
     where
@@ -129,11 +158,70 @@ impl Audit for UnpinnedUses {
             .map_err(AuditLoadError::Fail)?
             .unwrap_or_default();
 
+        // Create the default set of allowed orgs
+        let mut allowed_orgs = DEFAULT_OFFICIAL_ORGS
+            .iter()
+            .map(|s| s.to_string().to_lowercase())
+            .collect::<HashSet<String>>();
+        
+        // Add allowlisted orgs from file if specified via CLI
+        if let Some(allowlist_path) = &state.tpa_allowlist_file {
+            match fs::read_to_string(allowlist_path) {
+                Ok(contents) => {
+                    for line in contents.lines() {
+                        let trimmed = line.trim();
+                        // Skip empty lines and comments
+                        if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                            allowed_orgs.insert(trimmed.to_lowercase());
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to read allowlist file {}: {}", allowlist_path, e);
+                }
+            }
+        }
+        
+        // Add explicitly specified orgs from CLI
+        if let Some(additional_orgs) = &state.tpa_allowed_org {
+            for org in additional_orgs {
+                allowed_orgs.insert(org.to_lowercase());
+            }
+        }
+        
+        // Add any additional orgs specified in the config file
+        if let Some(allowlist_path) = &config.allowlist_file {
+            match fs::read_to_string(allowlist_path) {
+                Ok(contents) => {
+                    for line in contents.lines() {
+                        let trimmed = line.trim();
+                        // Skip empty lines and comments
+                        if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                            allowed_orgs.insert(trimmed.to_lowercase());
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to read config allowlist file {}: {}", allowlist_path, e);
+                }
+            }
+        }
+        
+        // Add any additional orgs specified in the config
+        if let Some(additional_orgs) = &config.additional_allowed_orgs {
+            for org in additional_orgs {
+                allowed_orgs.insert(org.to_lowercase());
+            }
+        }
+
         let policies = UnpinnedUsesPolicies::try_from(config)
             .context("invalid configuration")
             .map_err(AuditLoadError::Fail)?;
 
-        Ok(Self { policies })
+        Ok(Self { 
+            policies,
+            allowed_orgs,
+        })
     }
 
     fn audit_step<'doc>(&self, step: &Step<'doc>) -> anyhow::Result<Vec<Finding<'doc>>> {
@@ -156,6 +244,15 @@ impl Audit for UnpinnedUses {
 struct UnpinnedUsesConfig {
     /// A mapping of `uses:` patterns to policies.
     policies: HashMap<RepositoryUsesPattern, UsesPolicy>,
+    
+    /// Path to a file containing additional orgs/users to treat as trusted
+    /// Each line in the file should contain one org/user name
+    #[serde(default)]
+    allowlist_file: Option<String>,
+    
+    /// Additional allowed organizations to consider as trusted beyond the defaults
+    #[serde(default)]
+    additional_allowed_orgs: Option<Vec<String>>,
 }
 
 impl Default for UnpinnedUsesConfig {
@@ -177,6 +274,8 @@ impl Default for UnpinnedUsesConfig {
                 (RepositoryUsesPattern::Any, UsesPolicy::HashPin),
             ]
             .into(),
+            allowlist_file: None,
+            additional_allowed_orgs: None,
         }
     }
 }
@@ -252,31 +351,31 @@ impl TryFrom<UnpinnedUsesConfig> for UnpinnedUsesPolicies {
         let mut default_policy = UsesPolicy::HashPin;
 
         for (pattern, policy) in config.policies {
-            match pattern {
+            match &pattern {
                 // Patterns with refs don't make sense in this context, since
                 // we're establishing policies for the refs themselves.
                 RepositoryUsesPattern::ExactWithRef { .. } => {
                     return Err(anyhow::anyhow!("can't use exact ref patterns here"));
                 }
-                RepositoryUsesPattern::ExactPath { ref owner, .. } => {
+                RepositoryUsesPattern::ExactPath { owner, .. } => {
                     policy_tree
                         .entry(owner.clone())
                         .or_default()
                         .push((pattern, policy));
                 }
-                RepositoryUsesPattern::ExactRepo { ref owner, .. } => {
+                RepositoryUsesPattern::ExactRepo { owner, .. } => {
                     policy_tree
                         .entry(owner.clone())
                         .or_default()
                         .push((pattern, policy));
                 }
-                RepositoryUsesPattern::InRepo { ref owner, .. } => {
+                RepositoryUsesPattern::InRepo { owner, .. } => {
                     policy_tree
                         .entry(owner.clone())
                         .or_default()
                         .push((pattern, policy));
                 }
-                RepositoryUsesPattern::InOwner(ref owner) => {
+                RepositoryUsesPattern::InOwner(owner) => {
                     policy_tree
                         .entry(owner.clone())
                         .or_default()

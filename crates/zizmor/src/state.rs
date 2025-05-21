@@ -17,6 +17,8 @@ pub(crate) struct AuditState<'a> {
     pub(crate) cache_dir: PathBuf,
     pub(crate) gh_token: Option<String>,
     pub(crate) gh_hostname: GitHubHost,
+    pub(crate) tpa_allowlist_file: Option<String>,
+    pub(crate) tpa_allowed_org: Option<Vec<String>>,
 }
 
 impl<'a> AuditState<'a> {
@@ -41,6 +43,9 @@ impl<'a> AuditState<'a> {
             cache_dir,
             gh_token: app.gh_token.clone(),
             gh_hostname: app.gh_hostname.clone(),
+            // Initialize the new fields
+            tpa_allowlist_file: app.tpa_allowlist_file.clone(),
+            tpa_allowed_org: app.tpa_allowed_org.clone(),
         }
     }
 
