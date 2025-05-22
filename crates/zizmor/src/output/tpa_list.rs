@@ -1,5 +1,3 @@
-// Fixed tpa_list.rs without requiring Clone
-
 //! Format for listing third-party actions not pinned to commit SHAs.
 //! Can output either a simple text list or a comprehensive JSON report.
 
@@ -14,7 +12,7 @@ use crate::finding::Finding;
 use crate::audit::unpinned_uses::THIRD_PARTY_MESSAGE;
 
 /// An action extracted from a workflow file
-#[derive(Debug, Serialize, Clone)]  // Added explicit Clone derive
+#[derive(Debug, Serialize, Clone)]
 struct Action {
     /// The action reference (e.g., "actions/checkout@v3")
     reference: String,
@@ -46,7 +44,7 @@ struct Summary {
     unpinned_third_party: usize,
     /// Number of pinned third-party actions
     pinned_third_party: usize,
-    /// Number of official/trusted actions
+    /// Number of official actions
     official_actions: usize,
 }
 
@@ -57,75 +55,37 @@ fn extract_actions(findings: &[Finding]) -> Vec<Action> {
     // Map to keep track of all unique action references we've seen
     let mut seen_refs = HashSet::new();
     
-    // First, collect all unpinned third-party actions
-    let unpinned_findings = findings.iter()
-        .filter(|f| f.ident == "unpinned-uses")
-        .filter(|f| {
-            // Look for our special marker in the annotation
-            f.locations.iter().any(|loc| {
-                loc.symbolic.annotation == THIRD_PARTY_MESSAGE
-            })
-        });
-
-    for finding in unpinned_findings {
-        // Get the primary location, which should contain the action reference
+    // Process all workflow step uses clauses found in findings
+    for finding in findings.iter() {
+        // We want to examine all findings because each step with a uses clause could
+        // be referenced in different findings (e.g., unpinned-uses, forbidden-uses, etc.)
         if let Some(location) = finding.locations.iter().find(|loc| loc.symbolic.is_primary()) {
             let file_path = location.symbolic.key.presentation_path().to_string();
             
             // Extract the uses line from the feature text
             if let Some(action_ref) = extract_uses_reference(&location.concrete.feature) {
-                let action = Action {
-                    reference: action_ref.clone(),
-                    pinned_to_sha: false,
-                    third_party: true,
-                    line: location.concrete.feature.trim().to_string(),
-                    file_path: file_path.clone(),
-                };
-                
-                // Only add if we haven't seen this exact action reference before
-                let key = (file_path.clone(), action_ref.clone());
-                if !seen_refs.contains(&key) {
-                    seen_refs.insert(key);
-                    actions.push(action);
-                }
-            }
-        }
-    }
-    
-    // Next, collect all other uses: references
-    // This includes official actions and pinned third-party actions
-    let other_findings = findings.iter()
-        .filter(|f| f.ident == "unpinned-uses")
-        .filter(|f| {
-            // Exclude the ones we already processed
-            !f.locations.iter().any(|loc| {
-                loc.symbolic.annotation == THIRD_PARTY_MESSAGE
-            })
-        });
-
-    for finding in other_findings {
-        if let Some(location) = finding.locations.iter().find(|loc| loc.symbolic.is_primary()) {
-            let file_path = location.symbolic.key.presentation_path().to_string();
-            
-            if let Some(action_ref) = extract_uses_reference(&location.concrete.feature) {
-                let is_third_party = !is_official_action(&action_ref);
-                let is_pinned = action_ref.contains('@') && 
-                               (action_ref.matches('@').count() == 1) && 
-                               is_likely_sha(action_ref.split('@').nth(1).unwrap_or(""));
-                
-                let action = Action {
-                    reference: action_ref.clone(),
-                    pinned_to_sha: is_pinned,
-                    third_party: is_third_party,
-                    line: location.concrete.feature.trim().to_string(),
-                    file_path: file_path.clone(),
-                };
-                
-                // Only add if we haven't seen this exact action reference before
-                let key = (file_path.clone(), action_ref.clone());
-                if !seen_refs.contains(&key) {
-                    seen_refs.insert(key);
-                    actions.push(action);
+                // Only process if this looks like an action reference (has a slash)
+                // and isn't something like a docker image reference
+                if action_ref.contains('/') && !action_ref.starts_with("docker://") {
+                    let is_third_party = !is_official_action(&action_ref);
+                    let is_pinned = action_ref.contains('@') && 
+                                    (action_ref.matches('@').count() == 1) && 
+                                    is_likely_sha(action_ref.split('@').nth(1).unwrap_or(""));
+                    
+                    let action = Action {
+                        reference: action_ref.clone(),
+                        pinned_to_sha: is_pinned,
+                        third_party: is_third_party,
+                        line: location.concrete.feature.trim().to_string(),
+                        file_path: file_path.clone(),
+                    };
+                    
+                    // Only add if we haven't seen this exact action reference before
+                    let key = (file_path.clone(), action_ref.clone());
+                    if !seen_refs.contains(&key) {
+                        seen_refs.insert(key);
+                        actions.push(action);
+                    }
                 }
             }
         }
@@ -207,16 +167,16 @@ pub(crate) fn output(sink: impl io::Write, findings: &[Finding]) -> Result<()> {
     
     // Create the full report
     let report = ActionReport {
-        actions: all_actions,  // No need to clone now that Action implements Clone
+        actions: all_actions.clone(), // Include ALL actions in the JSON report
         summary,
     };
     
-    // Save the JSON report
+    // Save the JSON report with all actions
     let json_file = File::create("all_actions.json")?;
     serde_json::to_writer_pretty(json_file, &report)?;
     
-    // Output the simple TPA list to the command output
-    for action in &report.actions {
+    // Output ONLY the unpinned third-party actions to stdout
+    for action in &all_actions {
         if action.third_party && !action.pinned_to_sha {
             writeln!(sink, "{}: uses: {}", action.file_path, action.reference)?;
         }
